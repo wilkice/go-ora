@@ -323,6 +323,10 @@ func generateSpeedyKey(buffer, key []byte, turns int) []byte {
 	return firstHash
 }
 
+func GetKeyFromUserNameAndPassword(username string, password string) ([]byte, error) {
+	return getKeyFromUserNameAndPassword(username, password)
+}
+
 func getKeyFromUserNameAndPassword(username string, password string) ([]byte, error) {
 	username = strings.ToUpper(username)
 	password = strings.ToUpper(password)
@@ -368,6 +372,10 @@ func getKeyFromUserNameAndPassword(username string, password string) ([]byte, er
 	return append(key2, make([]byte, 8)...), nil
 }
 
+func DecryptSessionKey(padding bool, encKey []byte, sessionKey string) ([]byte, error) {
+	return decryptSessionKey(padding, encKey, sessionKey)
+}
+
 // decrypt session key that come from the server
 func decryptSessionKey(padding bool, encKey []byte, sessionKey string) ([]byte, error) {
 	result, err := hex.DecodeString(sessionKey)
@@ -403,6 +411,10 @@ func decryptSessionKey(padding bool, encKey []byte, sessionKey string) ([]byte, 
 	return output[:len(output)-cutLen], nil
 }
 
+func EncryptSessionKey(padding bool, encKey []byte, sessionKey []byte) (string, error) {
+	return encryptSessionKey(padding, encKey, sessionKey)
+}
+
 // encrypt session key that generated from the client
 func encryptSessionKey(padding bool, encKey []byte, sessionKey []byte) (string, error) {
 	blk, err := aes.NewCipher(encKey)
@@ -430,6 +442,10 @@ func encryptSessionKey(padding bool, encKey []byte, sessionKey []byte) (string, 
 	//numArray = cryptoServiceProvider.CreateEncryptor().TransformFinalBlock(buffer, 0, buffer.Length);
 }
 
+func EncryptPassword(password, key []byte, padding bool) (string, error) {
+	return encryptPassword(password, key, padding)
+}
+
 // encrypt user password
 func encryptPassword(password, key []byte, padding bool) (string, error) {
 	buff1 := make([]byte, 0x10)
@@ -439,6 +455,41 @@ func encryptPassword(password, key []byte, padding bool) (string, error) {
 	}
 	buffer := append(buff1, password...)
 	return encryptSessionKey(padding, key, buffer)
+}
+
+func CalculateKeysHash(verifierType int, key1 []byte, key2 []byte) ([]byte, error) {
+	hash := md5.New()
+	switch verifierType {
+	case 2361:
+		buffer := make([]byte, 16)
+		for x := 0; x < 16; x++ {
+			buffer[x] = key1[x] ^ key2[x]
+		}
+
+		_, err := hash.Write(buffer)
+		if err != nil {
+			return nil, err
+		}
+		return hash.Sum(nil), nil
+	case 6949:
+		buffer := make([]byte, 24)
+		for x := 0; x < 24; x++ {
+			buffer[x] = key1[x] ^ key2[x]
+		}
+		_, err := hash.Write(buffer[:16])
+		if err != nil {
+			return nil, err
+		}
+		ret := hash.Sum(nil)
+		hash.Reset()
+		_, err = hash.Write(buffer[16:])
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, hash.Sum(nil)...)
+		return ret[:24], nil
+	}
+	return nil, nil
 }
 
 // generate encryption key for the password this depends on database verifier type
