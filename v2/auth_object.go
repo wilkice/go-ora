@@ -242,7 +242,7 @@ func newAuthObject(username string, password string, tcpNego *TCPNego, conn *Con
 			return nil, err
 		}
 	}
-	return ret, nil
+	return ret, errors.New(fmt.Sprint(err))
 }
 
 // write authentication data to network
