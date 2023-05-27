@@ -10,6 +10,7 @@ import (
 )
 
 type OracleNetworkEncryption interface {
+	Reset() error
 	Encrypt(input []byte) ([]byte, error)
 	Decrypt(input []byte) ([]byte, error)
 }
@@ -182,7 +183,9 @@ func NewOracleNetworkCBCEncrypter(key, iv []byte) (*OracleNetworkCBCCryptor, err
 	if err != nil {
 		return nil, err
 	}
-
+	if iv == nil {
+		iv = make([]byte, 16)
+	}
 	output := &OracleNetworkCBCCryptor{blk: blk, iv: iv}
 	return output, nil
 }
@@ -216,6 +219,9 @@ func (sec *OracleNetworkCBCCryptor) Decrypt(input []byte) ([]byte, error) {
 	dec := cipher.NewCBCDecrypter(sec.blk, sec.iv)
 	dec.CryptBlocks(output, input[:length-1])
 	return output[:length-num], nil
+}
+func (set *OracleNetworkCBCCryptor) Reset() error {
+	return nil
 }
 func PKCS5Padding(cipherText []byte, blockSize int) []byte {
 	padding := blockSize - len(cipherText)%blockSize

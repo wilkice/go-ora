@@ -1,9 +1,506 @@
 # go-ora
 ## Pure go oracle client
+
 ### note:
+###### the original oracle drivers are very complex and contain many features which are difficult to add them at one time
+###### your feedbacks are very important for this project to proceed
+```
     - Use version 2 you will need to import github.com/sijms/go-ora/v2
     - V2 is more preferred for oracle servers 10.2 and above
+    - I always update the driver fixing issues and add new features so
+      always ensure that you get latest release
     - See examples for more help
+```
+### version 2.7.4:
+* activate global timeout value to protect against block read/write
+if no timeout context specified
+* default value for timeout is 30 second you can change by
+passing one of the following ["TIMEOUT", "CONNECT TIMEOUT", "CONNECTION TIMEOUT"]
+* other feature/issues:
+  * fix passing empty `[]byte{}` will produce error
+  * fix passing empty array as a parameter will produce error
+  * return first binding error when the driver return `ora-24381: error in DML array`
+### version 2.7.3: Use database/sql fail over
+* use database/sql fail over by returning driver.ErrBadConn
+when connection interrupted
+* other features:
+  * add support for RC4 encryption
+### version 2.7.2: Use golang structure as an oracle (output) parameters
+all rules used for input will be required for output plus:
+* structure should be passed as a pointer
+* tag direction is required to be output or inout. size is used with 
+some types like strings
+* each field will be translated to a parameter as follows
+```
+number      mapped to sql.NullFloat64
+varchar     mapped to sql.NullString
+nvarchar    mapped to sql.NullNVarchar
+date        mapped to sql.NullTime
+timestamp   mapped to NullTimeStamp
+timestamptz mapped to NullTimeStampTZ
+raw         mapped to []byte
+clob        mapped to Clob
+nclob       mapped to NClob
+blob        mapped to Blob
+```
+all fields that support driver.Valuer interface will be passed as it is
+* data assigned back to structure fields after exec finish when a null 
+value read then field value will set to `reflect.Zero`
+* `examples/struct_pars/main.go` contain full example for reading and
+writing struct pars
+### version 2.7.1: Use golang structure as an oracle (input) parameters
+* by define structure tag `db` now you can pass information to sql.Exec
+* data in `db` tag can be recognized by its position or as key=value 
+```golang
+type TEMP_TABLE struct {
+	// tag by position: db:"name,type,size,direction"
+	Id    int      `db:"ID,number"`
+	// tag as key=value: db:"size=size,name=name,dir=directiontype=type"
+	Name  string   `db:"type=varchar,name=NAME"`
+}
+```
+* you should pass at least the name of the parameter to use this feature
+* input parameters need only name and type. if you omit type driver will
+use field value directly as input parameter. type is used to make 
+some flexibility
+example use time.Time field and pass type=timestamp in this
+case timestamp will be used instead of default value for time.Time which is date
+* type can be one of the following: 
+```
+number      mapped to golang types integer, float, string, bool
+varchar     mapped to any golang types that can converted to string
+nvarchar    mapped to any golang types that can converted to string
+date        mapped to golang types time.Time and string
+timestamp   mapped to golang types time.Time and string
+timestamptz mapped to golang types time.Time and string
+raw         mapped to golang types []byte and string
+blob        mapped to golang types []byte and string
+clob        mapped to any golang types that can converted to string
+nclob       mapped to any golang types that can converted to string
+```
+* other features:
+  * tag for user defined type UDT changed from `oracle` to `udt`
+  * add 2 url options give the client control weather to use encryption, data integrity or not
+  ```golang
+  urlOptions := map[string]string {
+    // values can be "required", "accepted", "requested", and rejected"
+    "encryption": "required",
+    "data integrity": "rejected",
+  }
+  ```
+  * fix issue #350
+### version 2.6.17: Implement Bulk(Insert/Merge) in ExecContext
+* now you can make bulk (insert/merge) with sql driver Exec as follows:
+  * declare sql text with Insert or Merge
+  * pass all parameter as array
+  * number of rows inserted will equal to the least array size
+* Named parameter is also supported
+* full code is present in examples/merge
+### version 2.6.16: Map RefCursor to sql.Rows
+* mapping RefCursor to sql.Rows will work with select/scan.
+```golang
+// TEMP_FUNC_316 is sql function that return RefCursor
+sqlText := `SELECT TEMP_FUNC_316(10) from dual`
+
+// use Query and don't use QueryRow
+rows, err := conn.Query(sqlText)
+if err != nil {
+	return err
+}
+
+// closing the parent rows will automatically close cursor
+defer rows.Close()
+
+for rows.Next() {
+    var cursor sql.Rows
+	err = rows.Scan(&cursor)
+	if err != nil {
+		return err
+	}
+	var (
+        id   int64
+        name string
+        val  float64
+        date time.Time
+    )
+	
+    // reading operation should be inside rows.Next
+    for cursor.Next() {
+        err = cursor.Scan(&id, &name, &val, &date)
+        if err != nil {
+            return err
+        }
+        fmt.Println("ID: ", id, "\tName: ", name, "\tval: ", val, "\tDate: ", date)
+    }
+}
+```
+* complete code is present in `examples/refcursor_to_rows/main.go`
+### version 2.6.14: Add Support for Named Parameters
+* to switch on named parameter mode simply pass all 
+your parameter to `Query` or `Exec` as `sql.Named("name", Value)`
+* if one of the parameter doesn't contain **name** the driver automatically switch to
+positional mode
+* parameter name in sql will be for example `:pr1` 
+and its value will be `sql.Named("pr1", 1)`
+* when using named parameters the order of the parameters is not important as 
+the driver will re-arrange the parameter according to declaration in
+sql text
+* See `examples/named_pars/main.go` for example code
+### version 2.6.12: Add Client Charset option
+* this option will allow controlling string encoding and decoding at client level
+* so using this option you can define a charset for the client that is different from the server 
+* client charset will work in the following situation
+  * encoding sql text
+  * decoding varchar column
+  * encoding and decoding varchar parameters
+  * encoding and decoding CLOB
+* nvarchar, nclob and server messages are excluded from client charset
+* code
+```golang
+urlOptions := map[string]string {
+	// you can use also 
+	//"charset": "UTF8",
+	"client charset": "UTF8",
+	"trace file": "trace.log",
+}
+connStr := go_ora.BuildUrl("server", 1521, "service", "", "", urlOptions)
+```
+### version 2.6.9: Re-Code Failover
+* now failover start when receive the following error:
+  * io.EOF
+  * syscall.EPIPE
+* failover added for the following
+  * Query
+  * Fetch
+  * Exec
+  * Ping
+  * Commit
+  * Rollback
+  * RefCursor Query
+* In all situation Failover will try to reconnect before returning error except in case of Query failover will reconnect + requery
+### version 2.6.8: Fix return long data type with lob prefetch option:
+* now you can return up to 0x3FFFFFFF of data from long coumn type
+* examples/long insert 0x3FFF bytes of data into long column and query it again
+* for large data size better use `lob fetch=post`
+### version 2.6.5: Add New Url Options (Language and Territory)
+* this will control the language of the server messages
+```golang
+urlOptions := map[string]string {
+"language": "PORTUGUESE",
+"territory": "BRAZILIAN",
+}
+url := go_ora.BuildUrl(server, port, service, user, password, urlOptions)
+```
+### version 2.6.4: Add Support for TimeStamp with timezone
+* now you can use TimeStampTZ as input/output parameters to manage timestamp with timezone 
+* see code in examples/timestamp_tz
+### version 2.6.2: Add Support for Lob Prefetch
+* now you can control how you need to get lob data
+  * **pre-fetch (default)** = lob data is sent from the server before send lob locator
+  * **post-fetch** = lob data is sent from the server after send lob locator (need network call)
+* you can do this using url options
+```golang
+urlOptions := map[string]string {
+  "TRACE FILE": "trace.log",
+  "LOB FETCH": "PRE", // other value "POST"
+}
+connStr := go_ora.BuildUrl("server", 1521, "service", "", "", urlOptions)
+```
+### version 2.5.33: Add Support for Client Authentication
+* you should have server and client certificate store in wallets + working TCPS communication
+* create oracle user as follows:
+```sql
+CREATE USER "SSLCLIENT" IDENTIFIED EXTERNALLY AS 'CN=ORCLCLIENT';
+```
+* configure sqlnet.ora in the server to use client authentication
+```sql
+SQLNET.AUTHENTICATION_SERVICES=(TCPS,NTS)
+SSL_CLIENT_AUTHENTICATION=TRUE
+```
+* now connect 
+```golang
+urlOptions := map[string]string {
+  "TRACE FILE": "trace.log",
+  "AUTH TYPE":  "TCPS",
+  "SSL": "TRUE",
+  "SSL VERIFY": "FALSE",
+  "WALLET": "PATH TO WALLET"
+}
+connStr := go_ora.BuildUrl("server", 2484, "service", "", "", urlOptions)
+```
+### version 2.5.31: Add BulkCopy using DirectPath (experimental)
+* it is a way to insert large amount of rows in table or view
+* this feature use oracle [direct path](https://docs.oracle.com/database/121/ODPNT/featBulkCopy.htm#ODPNT212)
+* this feature still not implemented for the following types:
+  * LONG
+  * CLOB
+  * BLOB
+* for more help about using this feature return to bulk_copy example
+### version 2.5.19: Add Support for Kerberos5 Authentication
+* note that kerberos need an intact dns system
+* to test kerberos you need 3 machine
+  * kerberos server you can use this link to install [i use ubuntu because easy steps](https://ubuntu.com/server/docs/service-kerberos)
+  * oracle server you can configure it from this [link](https://docs.oracle.com/cd/E11882_01/network.112/e40393/asokerb.htm#ASOAG9636)
+  * client which contain our gocode using package [gokrb5](https://github.com/jcmturner/gokrb5)
+* there is an example code for kerberos, but you need to call `kinit user` before using the example
+```golang
+urlOptions := map[string]string{
+    "TRACE FILE": "trace.log",
+    "AUTH TYPE":  "KERBEROS",
+}
+// note empty password
+connStr := go_ora.BuildUrl("server", 1521, "service", "krb_user", "", urlOptions)
+
+type KerberosAuth struct{}
+func (kerb KerberosAuth) Authenticate(server, service string) ([]byte, error) {
+    // see implementation in examples/kerberos
+}
+advanced_nego.SetKerberosAuth(&KerberosAuth{})
+```
+### version 2.5.16: Add Support for cwallet.sso created with -auto_login_local option
+* note that this type of oracle wallets only work on the machine where they were created 
+### version 2.5.14: Failover and wallet update
+* Exec will return error after connection restore
+* add new field _**WALLET PASSWORD**_ to read ewallet.p12 file
+### version 2.5.13: Add Support For Failover (Experimental)
+* to use failover pass it into connection string as follow
+```golang
+urlOptions := map[string]string{
+	"FAILOVER": "5",
+	"TRACE FILE": "trace.log",
+}
+databaseUrl := go_ora.BuildUrl(server, port, service, user, password, urlOptions)
+```
+* FAILOVER value is integer indicate how many times the driver will try to reconnect after lose connection default value = 0
+* failover will activated when stmt receive io.EOF error during read or write
+* FAILOVER work in 3 places:
+    * Query when fail the driver will reconnect and re-query up to failover number.
+    * Exec when fail the driver will reconnect up to failover times then return the error to avoid unintended re-execution.
+    * Fetch when fail the driver will reconnect up to failover times then return the error (whatever failover success or fail)
+
+### version 2.4.28: Binary Double And Float Fix
+- Now you can read binary double and float without error issue#217
+- You can avoid calling cgo function `user.Current()` if you define environmental variable $USER
+### version 2.4.20: Query To Struct
+- you can query to struct that contain basic types (int, float, string, datetime)
+or any types that implement sql.Scanner interface
+- see query to struct example for more information
+### version 2.4.18: Add support for proxy user
+if you need to connect with proxy user pass following connection
+string
+```golang
+oracle://proxy_user:proxy_password@host:port/service?proxy client name=schema_owner
+```
+### version 2.4.8: JDBC connect string
+* Add new function go_ora.BuildJDBC
+```golang
+    // program will extract server, ports and protocol and build
+    // connection table
+    connStr := `(DESCRIPTION=
+    (ADDRESS_LIST=
+    	(LOAD_BALANCE=OFF)
+        (FAILOVER=ON)
+    	(address=(PROTOCOL=tcps)(host=localhost)(PORT=2484))
+    	(address=(protocol=tcp)(host=localhost)(port=1521))
+    )
+    (CONNECT_DATA=
+    	(SERVICE_NAME=service)
+        (SERVER=DEDICATED)
+    )
+    (SOURCE_ROUTE=yes)
+    )`
+    // use urlOption to set other options like:
+    // TRACE FILE = for debug
+    // note SSL automatically set from connStr (address=...
+    // SSL Verify = need to cancel certifiate verification
+    // wallet path
+    databaseUrl := go_ora.BuildJDBC(user, password, connStr, urlOptions)
+    conn, err := sql.Open("oracle", databaseUrl)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+    err = conn.Ping()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+```
+### version 2.4.5: Support BFile
+* connect as sys and create directory object that refer to physical directory
+* `grant read,write on directory 'dirName' to user`
+* put text file in the directory with name = fileName
+```golang
+// create and open connection before use BFile
+conn, err := go_ora.NewConnection(connStr)
+// check for error
+err = conn.Open()
+// check for error
+defer conn.Close()
+
+// Create BFile object
+file, err := go_ora.BFile(conn, dirName, fileName)
+// check for error
+
+// before use BFile it must be opened
+err = file.Open()
+// check for error
+defer file.Close()
+
+// does the file exist
+exists, err := file.Exists()
+// check for error
+
+if exists {
+    length, err := file.GetLength()
+    // check for error
+    
+    // read all data
+    data, err := file.Read()
+    
+    // read at position 2
+    data, err = file.ReadFromPos(2)
+    
+    // read 5 bytes count start at position 2
+    data, err = file.ReadBytesFromPos(2, 5)
+```
+* you can pass BFile object as input parameter or receive it from query or output parameters
+for more detail see example bfile
+### version 2.4.4: Support for unix socket IPC
+you can use this option if server and client on same linux machine
+by specify the following url option
+```golang
+urlOptions := map[string]string{
+	// change the value according to your machine
+	"unix socket": "/usr/tmp/.oracle/sEXTPROC1"
+}
+```
+### version 2.4.3: Input Parameter CLOB and BLOB Accept Large Data Size
+you can pass input CLOB and BLOB with any data size up to
+[data type limit](https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/datatype-limits.html#GUID-963C79C9-9303-49FE-8F2D-C8AAF04D3095)
+### version 2.4.1: Add support for connection time out + context read and write
+you can determine connection overall lifetime through url options
+```golang
+// set connection time for 3 second
+urlOptions := map[string]string {
+    "CONNECTION TIMEOUT": "3"
+}
+databaseUrl := go_ora.BuildUrl(server, port, service, user, password, urlOptions)
+```
+see context example for more help about using context
+### version 2.4.0: Add support for Arrays
+* add support for oracle associative array as input and output parameter type
+* add BulkInsert function which dramatically improve performance (> 10x) during insert
+* add support for nullable type in DataSet.Scan function
+* Bug fixes
+* examples (bulk_insert and arrays) contain explanation of use of this 2 major features
+```golang
+// sqlText: sql text with parameters
+// rowNum: number of rows to insert
+// columns: each column contain array of driver.Value size of column should
+//          equal to rowNum
+func (conn *Connection) BulkInsert(sqlText string, rowNum int, columns ...[]driver.Value) (*QueryResult, error) 
+```
+### version 2.3.5: Add support for OS Auth (Windows) With Password Hash
+now you can pass password hash of the user instead of real password
+#### source of hash:
+* windows registry
+* create the hash by md4(unicode(password))
+passing hash through url option as follow
+```golang
+urlOptions := map[string]string {
+	"OS HASH": "yourpasswordhash"
+	// or
+	"OS PassHash": "yourpasswordhash"
+	// or
+	"OS Password Hash": "yourpasswordhash"
+}
+```
+#### note:
+you can use NTSAuthInterface
+```golang
+type YourCustomNTSManager struct {
+	NTSAuthDefault
+}
+func (nts *NTSAuthHash) ProcessChallenge(chaMsgData []byte, user, password string) ([]byte, error) {
+    // password = get (extract) password hash from Windows registry
+	return ntlmssp.ProcessChallengeWithHash(chaMsgData, user, password)
+}
+// now you can pass empty user and password to the driver
+```
+### version 2.3.3: Add support for OS Auth (Windows)
+you can see windows_os_auth example for more detail
+* NTS packets are supplied from the following github package:
+  [go-ntlmssp](https://github.com/Azure/go-ntlmssp)
+* empty username or password will suppose OS Auth by default
+* `AUTH TYPE: "OS"` optional
+* `OS USER` optional if omit the client will use logon user
+* `OS PASS` is obligatory to make OS Auth using NTS
+* `DOMAIN` optional for windows domain
+* `AUTH SERV: "NTS"` optional as NTS is automatically added if the client running on Windows machine
+* `DBA PRIVILEGE: "SYSDBA"` optional if you need a SYSDBA access
+```golang
+urlOptions := map[string]string{
+    // automatically set if you pass an empty oracle user or password
+    // otherwise you need to set it
+    "AUTH TYPE": "OS",
+    // operating system user if empty the driver will use logon user name
+    "OS USER": user,
+    // operating system password needed for os logon
+     "OS PASS": password,
+    // Windows system domain name
+    "DOMAIN": domain,
+    // NTS is the required for Windows os authentication
+    // when you run the program from Windows machine it will be added automatically
+    // otherwise you need to specify it
+    "AUTH SERV": "NTS",
+    // uncomment this option for debugging
+    "TRACE FILE": "trace.log",
+}
+databaseUrl := go_ora.BuildUrl(server, port, service, "", "", urlOptions)
+```
+#### note (Remote OS Auth):
+* you can make OS Auth **on the same machine** (Windows Server) 
+or **different machine** (Windows Server) and (Other Client) and in this situation you need to pass 
+`AUTH SERV: "NTS"` as url parameter
+#### note (advanced users):
+* You can use custom NTS auth manager by implementing the following interface
+```Golang
+type NTSAuthInterface interface {
+	NewNegotiateMessage(domain, machine string) ([]byte, error)
+	ProcessChallenge(chaMsgData []byte, user, password string) ([]byte, error)
+}
+```
+* set newNTS auth manager before open the connection
+```golang
+go_ora.SetNTSAuth(newNTSManager)
+```
+* advantage of custom manager: you may not need to provide OS Password. for example using
+.NET or Windows API code as original driver
+```cs
+// CustomStream will take data from NegotiateStream and give it to the driver
+// through NewNegotiateMessage
+// Then take data form the driver (Challenge Message) to NegotiateStream
+// And return back Authentication msg to the driver through ProcessChallenge
+// as you see here CredentialCache.DefaultNetworkCredentials will take auth data
+// (username and password) from logon user
+new NegotiateStream(new YourCustomStream(), true).AuthenticateAsClient(CredentialCache.DefaultNetworkCredentials, "", ProtectionLevel.None, TokenImpersonationLevel.Identification);
+```
+
+### version 2.3.1: Fix issue related to use ipv6
+now you can define url that contain ipv6
+```go
+url := go_ora.BuildUrl("::1", 1521, "service", "user", "password", nil)
+url = "oracle://user:password@[::1]:1521/service"
+```
+### version 2.3.0: Add support for Nullable types
+* support for nullable type in output parameters
+* add more nullable type NullTimeStamp and NullNVarChar
+### version 2.2.25: Add support for User Defined Type (UDT) as input and output parameter
+* see example udt_pars for more help
+### version 2.2.23: User Defined Type (UDT) as input parameters
+* Add support for UDT as input parameter
+* Add go_ora.Out struct with Size member to set output parameter size
 ### version 2.2.22: Lob for output parameters
 * Add new types for output parameter which is `go_ora.Clob` and `go_ora.Blob`
 used for receiving Clob and Blob from output parameters **_see clob example for 

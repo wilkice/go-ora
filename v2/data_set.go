@@ -1,16 +1,17 @@
 package go_ora
 
 import (
+	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
-	"github.com/sijms/go-ora/v2/network"
-	"github.com/sijms/go-ora/v2/trace"
 	"io"
 	"reflect"
-	"strconv"
 	"strings"
 	"time"
+
+	"github.com/sijms/go-ora/v2/network"
+	"github.com/sijms/go-ora/v2/trace"
 )
 
 // Compile time Sentinels for implemented Interfaces.
@@ -18,8 +19,8 @@ var _ = driver.Rows((*DataSet)(nil))
 var _ = driver.RowsColumnTypeDatabaseTypeName((*DataSet)(nil))
 var _ = driver.RowsColumnTypeLength((*DataSet)(nil))
 var _ = driver.RowsColumnTypeNullable((*DataSet)(nil))
+var _ = driver.RowsColumnTypePrecisionScale((*DataSet)(nil))
 
-// var _ = driver.RowsColumnTypePrecisionScale((*DataSet)(nil))
 // var _ = driver.RowsColumnTypeScanType((*DataSet)(nil))
 // var _ = driver.RowsNextResultSet((*DataSet)(nil))
 
@@ -100,6 +101,9 @@ func (dataSet *DataSet) setBitVector(bitVector []byte) {
 }
 
 func (dataSet *DataSet) Close() error {
+	if dataSet.parent.CanAutoClose() {
+		return dataSet.parent.Close()
+	}
 	return nil
 }
 
@@ -152,36 +156,52 @@ func (dataSet *DataSet) Scan(dest ...interface{}) error {
 			}
 			//col := dataSet.currentRow[srcIndex + processedFields]
 			f := destTyp.Elem().Field(x)
-			tag := f.Tag.Get("db")
-			if len(tag) == 0 {
+			fieldID, _, _, _ := extractTag(f.Tag.Get("db"))
+			if len(fieldID) == 0 {
 				continue
 			}
-			tag = strings.Trim(tag, "\"")
-			parts := strings.Split(tag, ",")
-			for _, part := range parts {
-				subs := strings.Split(part, ":")
-				if len(subs) != 2 {
-					continue
-				}
-				if strings.TrimSpace(strings.ToLower(subs[0])) == "name" {
-					fieldID := strings.TrimSpace(strings.ToUpper(subs[1]))
-					colInfo := dataSet.Cols[srcIndex+processedFields]
-					if strings.ToUpper(colInfo.Name) != fieldID {
-						continue
-						//return fmt.Errorf(
-						//	"go-ora: column %d name %s is mismatching with tag name %s of structure field",
-						//	srcIndex+processedFields, colInfo.Name, fieldID)
-					}
-					result, err := dataSet.setObjectValue(reflect.ValueOf(dest[destIndex]).Elem().Field(x), srcIndex+processedFields)
-					if err != nil {
-						return err
-					}
-					if !result {
-						return errors.New("only basic types are allowed inside struct object")
-					}
-					processedFields++
-				}
+			colInfo := dataSet.Cols[srcIndex+processedFields]
+			if strings.ToUpper(colInfo.Name) != strings.ToUpper(fieldID) {
+				continue
 			}
+			result, err := dataSet.setObjectValue(reflect.ValueOf(dest[destIndex]).Elem().Field(x), srcIndex+processedFields)
+			if err != nil {
+				return err
+			}
+			if !result {
+				return errors.New("only basic types are allowed inside struct object")
+			}
+			processedFields++
+			//tag := f.Tag.Get("db")
+			//if len(tag) == 0 {
+			//	continue
+			//}
+			//tag = strings.Trim(tag, "\"")
+			//parts := strings.Split(tag, ",")
+			//for _, part := range parts {
+			//	subs := strings.Split(part, ":")
+			//	if len(subs) != 2 {
+			//		continue
+			//	}
+			//	if strings.TrimSpace(strings.ToLower(subs[0])) == "name" {
+			//		fieldID := strings.TrimSpace(strings.ToUpper(subs[1]))
+			//		colInfo := dataSet.Cols[srcIndex+processedFields]
+			//		if strings.ToUpper(colInfo.Name) != fieldID {
+			//			continue
+			//			//return fmt.Errorf(
+			//			//	"go-ora: column %d name %s is mismatching with tag name %s of structure field",
+			//			//	srcIndex+processedFields, colInfo.Name, fieldID)
+			//		}
+			//		result, err := dataSet.setObjectValue(reflect.ValueOf(dest[destIndex]).Elem().Field(x), srcIndex+processedFields)
+			//		if err != nil {
+			//			return err
+			//		}
+			//		if !result {
+			//			return errors.New("only basic types are allowed inside struct object")
+			//		}
+			//		processedFields++
+			//	}
+			//}
 		}
 		if processedFields == 0 {
 			return errors.New("passing struct to scan without matching tags")
@@ -195,12 +215,22 @@ func (dataSet *DataSet) Scan(dest ...interface{}) error {
 // set object value using currentRow[colIndex] return true if succeed or false
 // for non-supported type
 // error means error occur during operation
-func (dataSet DataSet) setObjectValue(obj reflect.Value, colIndex int) (bool, error) {
+func (dataSet *DataSet) setObjectValue(obj reflect.Value, colIndex int) (bool, error) {
 	field := dataSet.currentRow[colIndex]
 	col := dataSet.Cols[colIndex]
 	if col.cusType != nil && col.cusType.typ == obj.Type() {
 		obj.Set(reflect.ValueOf(field))
 		return true, nil
+	}
+	if temp, ok := obj.Interface().(sql.Scanner); ok {
+		err := temp.Scan(field)
+		return err == nil, err
+	}
+	if obj.CanAddr() {
+		if temp, ok := obj.Addr().Interface().(sql.Scanner); ok {
+			err := temp.Scan(field)
+			return err == nil, err
+		}
 	}
 	switch obj.Type().Kind() {
 	case reflect.String:
@@ -224,66 +254,27 @@ func (dataSet DataSet) setObjectValue(obj reflect.Value, colIndex int) (bool, er
 		}
 		obj.SetFloat(temp)
 	default:
-		if obj.Type() == reflect.TypeOf(time.Time{}) {
-			if _, ok := field.(time.Time); ok {
+		switch obj.Type() {
+		case reflect.TypeOf(time.Time{}):
+			switch tempField := field.(type) {
+			case time.Time:
 				obj.Set(reflect.ValueOf(field))
-			} else {
+			case TimeStamp:
+				obj.Set(reflect.ValueOf(time.Time(tempField)))
+			default:
 				return false, fmt.Errorf("go-ora: column %d require type time.Time", colIndex)
 			}
-		} else if obj.Type() == reflect.TypeOf([]byte{}) {
+		case reflect.TypeOf([]byte{}):
 			if _, ok := field.([]byte); ok {
 				obj.Set(reflect.ValueOf(field))
 			} else {
 				return false, fmt.Errorf("go-ora: column %d require type []byte", colIndex)
 			}
-		} else {
+		default:
 			return false, nil
 		}
 	}
 	return true, nil
-}
-
-// try to get string data from row field
-func getString(col interface{}) string {
-	if temp, ok := col.(string); ok {
-		return temp
-	} else {
-		return fmt.Sprintf("%v", col)
-	}
-}
-
-// try to get float64 data from row field
-func getFloat(col interface{}) (float64, error) {
-	if temp, ok := col.(float64); ok {
-		return temp, nil
-	} else if temp, ok := col.(int64); ok {
-		return float64(temp), nil
-	} else if temp, ok := col.(string); ok {
-		tempFloat, err := strconv.ParseFloat(temp, 64)
-		if err != nil {
-			return 0, err
-		}
-		return tempFloat, nil
-	} else {
-		return 0, errors.New("unkown type")
-	}
-}
-
-// try to get int64 value from the row field
-func getInt(col interface{}) (int64, error) {
-	if temp, ok := col.(int64); ok {
-		return temp, nil
-	} else if temp, ok := col.(float64); ok {
-		return int64(temp), nil
-	} else if temp, ok := col.(string); ok {
-		tempInt, err := strconv.ParseInt(temp, 10, 64)
-		if err != nil {
-			return 0, err
-		}
-		return tempInt, nil
-	} else {
-		return 0, errors.New("unkown type")
-	}
 }
 
 func (dataSet *DataSet) Err() error {
@@ -294,10 +285,24 @@ func (dataSet *DataSet) Err() error {
 func (dataSet *DataSet) Next(dest []driver.Value) error {
 	hasMoreRows := dataSet.parent.hasMoreRows()
 	noOfRowsToFetch := len(dataSet.rows) // dataSet.parent.noOfRowsToFetch()
-	//hasBLOB := dataSet.parent.hasBLOB()
-	//hasLONG := dataSet.parent.hasLONG()
+	//if noOfRowsToFetch == 0 {
+	//	return io.EOF
+	//}
+	hasBLOB := dataSet.parent.hasBLOB()
+	hasLONG := dataSet.parent.hasLONG()
 	if !hasMoreRows && noOfRowsToFetch == 0 {
 		return io.EOF
+	}
+	if hasMoreRows && (hasBLOB || hasLONG) && dataSet.index == 0 {
+		//dataSet.rows = make([]Row, 0, dataSet.parent.noOfRowsToFetch())
+		if err := dataSet.parent.fetch(dataSet); err != nil {
+			return err
+		}
+		noOfRowsToFetch = len(dataSet.rows)
+		hasMoreRows = dataSet.parent.hasMoreRows()
+		if !hasMoreRows && noOfRowsToFetch == 0 {
+			return io.EOF
+		}
 	}
 	if dataSet.index > 0 && dataSet.index%len(dataSet.rows) == 0 {
 		if hasMoreRows {
@@ -316,14 +321,13 @@ func (dataSet *DataSet) Next(dest []driver.Value) error {
 			return io.EOF
 		}
 	}
-	//if hasMoreRows && (hasBLOB || hasLONG) && dataSet.index == 0 {
-	//	//dataSet.rows = make([]Row, 0, dataSet.parent.noOfRowsToFetch())
-	//	if err := dataSet.parent.fetch(dataSet); err != nil {
-	//		return err
-	//	}
-	//}
+
 	if dataSet.index%noOfRowsToFetch < len(dataSet.rows) {
-		for x := 0; x < len(dataSet.rows[dataSet.index%noOfRowsToFetch]); x++ {
+		length := len(dataSet.rows[dataSet.index%noOfRowsToFetch])
+		if len(dest) < length {
+			length = len(dest)
+		}
+		for x := 0; x < length; x++ {
 			dest[x] = dataSet.rows[dataSet.index%noOfRowsToFetch][x]
 		}
 		dataSet.index++
@@ -359,7 +363,7 @@ func (dataSet *DataSet) Columns() []string {
 	return ret
 }
 
-func (dataSet DataSet) Trace(t trace.Tracer) {
+func (dataSet *DataSet) Trace(t trace.Tracer) {
 	for r, row := range dataSet.rows {
 		if r > 25 {
 			break
@@ -372,26 +376,67 @@ func (dataSet DataSet) Trace(t trace.Tracer) {
 }
 
 // ColumnTypeDatabaseTypeName return Col DataType name
-func (dataSet DataSet) ColumnTypeDatabaseTypeName(index int) string {
+func (dataSet *DataSet) ColumnTypeDatabaseTypeName(index int) string {
 	return dataSet.Cols[index].DataType.String()
 }
 
 // ColumnTypeLength return length of column type
-func (dataSet DataSet) ColumnTypeLength(index int) (length int64, ok bool) {
-	length = int64(len(dataSet.Cols[index].BValue))
-	ok = true
-	return
-	//switch dataSet.Cols[index].DataType {
-	//case NCHAR, CHAR:
-	//	return int64(dataSet.Cols[index].MaxCharLen), true
-	//case NUMBER:
-	//	return int64(dataSet.Cols[index].Precision), true
-	//}
-	//return int64(0), false
-
+func (dataSet *DataSet) ColumnTypeLength(index int) (int64, bool) {
+	switch dataSet.Cols[index].DataType {
+	case NCHAR, CHAR:
+		return int64(dataSet.Cols[index].MaxCharLen), true
+	}
+	return int64(0), false
 }
 
 // ColumnTypeNullable return if column allow null or not
-func (dataSet DataSet) ColumnTypeNullable(index int) (nullable, ok bool) {
+func (dataSet *DataSet) ColumnTypeNullable(index int) (nullable, ok bool) {
 	return dataSet.Cols[index].AllowNull, true
+}
+
+// ColumnTypePrecisionScale return the precision and scale for numeric types
+func (dataSet *DataSet) ColumnTypePrecisionScale(index int) (int64, int64, bool) {
+	switch dataSet.Cols[index].DataType {
+	case NUMBER:
+		return int64(dataSet.Cols[index].Precision), int64(dataSet.Cols[index].Scale), true
+	}
+	return int64(0), int64(0), false
+}
+
+func (dataSet *DataSet) ColumnTypeScanType(index int) reflect.Type {
+	col := dataSet.Cols[index]
+	switch col.DataType {
+	case NUMBER:
+		if col.Precision > 0 {
+			return reflect.TypeOf(float64(0.0))
+		} else {
+			return reflect.TypeOf(int64(0))
+		}
+	case ROWID, UROWID:
+		fallthrough
+	case CHAR, NCHAR:
+		fallthrough
+	case OCIClobLocator:
+		return reflect.TypeOf("")
+	case RAW:
+		fallthrough
+	case OCIBlobLocator, OCIFileLocator:
+		return reflect.TypeOf([]byte{})
+	case DATE, TIMESTAMP:
+		fallthrough
+	case TimeStampDTY:
+		fallthrough
+	case TimeStampeLTZ, TimeStampLTZ_DTY:
+		fallthrough
+	case TIMESTAMPTZ, TimeStampTZ_DTY:
+		return reflect.TypeOf(time.Time{})
+	case IBFloat:
+		return reflect.TypeOf(float32(0.0))
+	case IBDouble:
+		return reflect.TypeOf(float64(0.0))
+	case IntervalDS_DTY, IntervalYM_DTY:
+		return reflect.TypeOf("")
+	default:
+		return nil
+	}
 }

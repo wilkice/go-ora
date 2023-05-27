@@ -1,6 +1,7 @@
 package go_ora
 
 import (
+	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -11,8 +12,11 @@ import (
 )
 
 type customType struct {
+	owner    string
+	name     string
 	attribs  []ParameterInfo
 	typ      reflect.Type
+	toid     []byte // type oid
 	filedMap map[string]int
 }
 
@@ -46,51 +50,48 @@ func (conn *Connection) RegisterTypeWithOwner(owner, typeName string, typeObj in
 	if typ.Kind() != reflect.Struct {
 		return errors.New("type object should be of structure type")
 	}
-	cust := customType{typ: typ, filedMap: map[string]int{}}
+	cust := customType{
+		owner:    owner,
+		name:     typeName,
+		typ:      typ,
+		filedMap: map[string]int{},
+	}
+	err := cust.getTOID(conn)
+	if err != nil {
+		return err
+	}
 	sqlText := `SELECT ATTR_NAME, ATTR_TYPE_NAME, LENGTH, ATTR_NO 
 FROM ALL_TYPE_ATTRS WHERE UPPER(OWNER)=:1 AND UPPER(TYPE_NAME)=:2`
+
 	stmt := NewStmt(sqlText, conn)
 	defer func(stmt *Stmt) {
 		_ = stmt.Close()
 	}(stmt)
-	stmt.AddParam("1", strings.ToUpper(owner), 40, Input)
-	stmt.AddParam("2", strings.ToUpper(typeName), 40, Input)
-	values := make([]driver.Value, 4)
-	rows, err := stmt.Query(nil)
+	err = stmt.AddParam("1", strings.ToUpper(owner), 40, Input)
+	if err != nil {
+		return err
+	}
+	err = stmt.AddParam("2", strings.ToUpper(typeName), 40, Input)
+	if err != nil {
+		return err
+	}
+	//values := make([]driver.Value, 4)
+	rows, err := stmt.Query_(nil)
 	if err != nil {
 		return err
 	}
 	var (
-		attName     string
+		attName     sql.NullString
 		attOrder    int64
-		attTypeName string
-		length      int64
-		ok          bool
+		attTypeName sql.NullString
+		length      sql.NullInt64
 	)
-	for {
-		err = rows.Next(values)
+	for rows.Next_() {
+		err = rows.Scan(&attName, &attTypeName, &length, &attOrder)
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
 			return err
 		}
-		if attName, ok = values[0].(string); !ok {
-			return errors.New(fmt.Sprint("error reading attribute properties for type: ", typeName))
-		}
-		if attTypeName, ok = values[1].(string); !ok {
-			return errors.New(fmt.Sprint("error reading attribute properties for type: ", typeName))
-		}
-		if values[2] == nil {
-			length = 0
-		} else {
-			if length, ok = values[2].(int64); !ok {
-				return errors.New(fmt.Sprint("error reading attribute properties for type: ", typeName))
-			}
-		}
-		if attOrder, ok = values[3].(int64); !ok {
-			return errors.New(fmt.Sprint("error reading attribute properties for type: ", typeName))
-		}
+
 		for int(attOrder) > len(cust.attribs) {
 			cust.attribs = append(cust.attribs, ParameterInfo{
 				Direction:   Input,
@@ -100,46 +101,68 @@ FROM ALL_TYPE_ATTRS WHERE UPPER(OWNER)=:1 AND UPPER(TYPE_NAME)=:2`
 			})
 		}
 		param := &cust.attribs[attOrder-1]
-		param.Name = attName
-		param.TypeName = attTypeName
-		switch strings.ToUpper(attTypeName) {
+		param.Name = attName.String
+		param.TypeName = attTypeName.String
+		switch strings.ToUpper(attTypeName.String) {
 		case "NUMBER":
-			param.DataType = NUMBER
-			param.ContFlag = 0
-			param.MaxCharLen = 0
-			param.MaxLen = 22
-			param.CharsetForm = 0
+			param.setForNumber()
 		case "VARCHAR2":
 			param.DataType = NCHAR
 			param.CharsetForm = 1
 			param.ContFlag = 16
-			param.MaxCharLen = int(length)
-			param.MaxLen = int(length) * converters.MaxBytePerChar(param.CharsetID)
+			param.MaxCharLen = int(length.Int64)
+			param.MaxLen = int(length.Int64) * converters.MaxBytePerChar(param.CharsetID)
 		case "NVARCHAR2":
 			param.DataType = NCHAR
 			param.CharsetForm = 2
 			param.ContFlag = 16
-			param.MaxCharLen = int(length)
-			param.MaxLen = int(length) * converters.MaxBytePerChar(param.CharsetID)
+			param.MaxCharLen = int(length.Int64)
+			param.MaxLen = int(length.Int64) * converters.MaxBytePerChar(param.CharsetID)
 		case "TIMESTAMP":
 			fallthrough
 		case "DATE":
 			param.DataType = DATE
 			param.ContFlag = 0
 			param.MaxLen = 11
-			param.MaxCharLen = 11
+			//param.MaxCharLen = 11
 		case "RAW":
 			param.DataType = RAW
 			param.ContFlag = 0
-			param.MaxLen = int(length)
+			param.MaxLen = int(length.Int64)
 			param.MaxCharLen = 0
 			param.CharsetForm = 0
 		default:
-			return errors.New(fmt.Sprint("unsupported attribute type: ", attTypeName))
+			return fmt.Errorf("unsupported attribute type: %s", attTypeName.String)
 		}
 	}
+	//for {
+	//	err = rows.Next(values)
+	//	if err != nil {
+	//		if errors.Is(err, io.EOF) {
+	//			break
+	//		}
+	//		return err
+	//	}
+	//	if attName, ok = values[0].(string); !ok {
+	//		return errors.New(fmt.Sprint("error reading attribute properties for type: ", typeName))
+	//	}
+	//	if attTypeName, ok = values[1].(string); !ok {
+	//		return errors.New(fmt.Sprint("error reading attribute properties for type: ", typeName))
+	//	}
+	//	if values[2] == nil {
+	//		length = 0
+	//	} else {
+	//		if length, ok = values[2].(int64); !ok {
+	//			return fmt.Errorf("error reading attribute properties for type: %s", typeName)
+	//		}
+	//	}
+	//	if attOrder, ok = values[3].(int64); !ok {
+	//		return fmt.Errorf("error reading attribute properties for type: %s", typeName)
+	//	}
+	//
+	//}
 	if len(cust.attribs) == 0 {
-		return errors.New(fmt.Sprint("unknown or empty type: ", typeName))
+		return fmt.Errorf("unknown or empty type: %s", typeName)
 	}
 	cust.loadFieldMap()
 	conn.cusTyp[strings.ToUpper(typeName)] = cust
@@ -289,31 +312,61 @@ END;`
 	return nil
 }
 
+func (cust *customType) getTOID(conn *Connection) error {
+	sqlText := `SELECT type_oid FROM ALL_TYPES WHERE UPPER(OWNER)=:1 AND UPPER(TYPE_NAME)=:2`
+	stmt := NewStmt(sqlText, conn)
+	defer func(stmt *Stmt) {
+		_ = stmt.Close()
+	}(stmt)
+	stmt.AddParam("1", strings.ToUpper(cust.owner), 0, Input)
+	stmt.AddParam("2", strings.ToUpper(cust.name), 0, Input)
+	rows, err := stmt.Query_(nil)
+	if err != nil {
+		return err
+	}
+	if rows.Next_() {
+		err = rows.Scan(&cust.toid)
+		if err != nil {
+			return err
+		}
+	}
+	if len(cust.toid) == 0 {
+		return fmt.Errorf("unknown type: %s", cust.name)
+	}
+	return rows.Err()
+}
+
 // loadFieldMap read struct tag that supplied with golang type object passed in RegisterType
 // function
 func (cust *customType) loadFieldMap() {
 	typ := cust.typ
 	for x := 0; x < typ.NumField(); x++ {
 		f := typ.Field(x)
-		tag := f.Tag.Get("oracle")
-		if len(tag) == 0 {
+		fieldID, _, _, _ := extractTag(f.Tag.Get("udt"))
+		if len(fieldID) == 0 {
 			continue
 		}
-		tag = strings.Trim(tag, "\"")
-		parts := strings.Split(tag, ",")
-		for _, part := range parts {
-			subs := strings.Split(part, ":")
-			if len(subs) == 0 {
-				continue
-			}
-			if strings.TrimSpace(strings.ToLower(subs[0])) == "name" {
-				if len(subs) == 1 {
-					continue
-				}
-				fieldID := strings.TrimSpace(strings.ToUpper(subs[1]))
-				cust.filedMap[fieldID] = x
-			}
-		}
+		fieldID = strings.ToUpper(fieldID)
+		cust.filedMap[fieldID] = x
+		//tag := f.Tag.Get("oracle")
+		//if len(tag) == 0 {
+		//	continue
+		//}
+		//tag = strings.Trim(tag, "\"")
+		//parts := strings.Split(tag, ",")
+		//for _, part := range parts {
+		//	subs := strings.Split(part, ":")
+		//	if len(subs) == 0 {
+		//		continue
+		//	}
+		//	if strings.TrimSpace(strings.ToLower(subs[0])) == "name" {
+		//		if len(subs) == 1 {
+		//			continue
+		//		}
+		//		fieldID := strings.TrimSpace(strings.ToUpper(subs[1]))
+		//		cust.filedMap[fieldID] = x
+		//	}
+		//}
 	}
 }
 
@@ -325,8 +378,48 @@ func (cust *customType) getObject() interface{} {
 	obj := reflect.New(typ)
 	for _, attrib := range cust.attribs {
 		if fieldIndex, ok := cust.filedMap[attrib.Name]; ok {
-			obj.Elem().Field(fieldIndex).Set(reflect.ValueOf(attrib.Value))
+			if attrib.Value != nil {
+				//tempField := obj.Elem().Field(fieldIndex)
+
+				//err := setValue(&tempField, attrib.Value)
+				//if err != nil {
+				//	panic(err)
+				//}
+				tempPar := ParameterInfo{Value: obj.Elem().Field(fieldIndex).Interface()}
+				err := tempPar.setParameterValue(attrib.Value)
+				if err != nil {
+					return err
+				}
+
+				obj.Elem().Field(fieldIndex).Set(reflect.ValueOf(tempPar.Value))
+			}
 		}
 	}
 	return obj.Elem().Interface()
 }
+
+//func (cust *customType) getFieldRepr(index int, input_value interface{}) ([]byte, error) {
+//	attrib := cust.attribs[index]
+//	//typ := reflect.TypeOf(val)
+//	val := reflect.ValueOf(input_value)
+//	typ := val.Type()
+//	switch attrib.DataType {
+//	case NUMBER:
+//		switch typ.Kind() {
+//		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+//			fallthrough
+//		case reflect.Int, reflect.Int32, reflect.Int16, reflect.Int64, reflect.Int8:
+//			return converters.EncodeInt64(reflect.ValueOf(val).Int()), nil
+//		case reflect.Float32, reflect.Float64:
+//			return converters.EncodeDouble(reflect.ValueOf(val).Float())
+//		default:
+//			return nil, fmt.Errorf("field %d require NUMBER data type", index)
+//		}
+//	case DATE:
+//		if typ == reflect.TypeOf(time.Time{}) {
+//			//return converters.EncodeDate(val.Interface())
+//		}
+//
+//	}
+//	return nil, nil
+//}
